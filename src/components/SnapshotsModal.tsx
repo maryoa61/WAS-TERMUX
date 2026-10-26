@@ -10,6 +10,7 @@
 import React, { useEffect, useState } from 'react';
 import { storage, type VMSnapshot } from '../storage';
 import { vmManager } from '../vm-manager';
+import { ConfirmModal } from './ConfirmModal';
 import {
   X,
   Save,
@@ -34,6 +35,8 @@ export const SnapshotsModal: React.FC<SnapshotsModalProps> = ({ isOpen, onClose 
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);
   const [autoSave, setAutoSave] = useState<boolean>(false);
+  const [snapshotToRestore, setSnapshotToRestore] = useState<string | null>(null);
+  const [snapshotToDelete, setSnapshotToDelete] = useState<string | null>(null);
 
   const loadSnapshots = async () => {
     try {
@@ -73,11 +76,14 @@ export const SnapshotsModal: React.FC<SnapshotsModalProps> = ({ isOpen, onClose 
     }
   };
 
-  const handleRestoreSnapshot = async (id: string) => {
-    if (!confirm('Restore this VM snapshot? Current unsaved memory will be replaced.')) {
-      return;
-    }
+  const handleRestoreSnapshot = (id: string) => {
+    setSnapshotToRestore(id);
+  };
 
+  const handleConfirmRestore = async () => {
+    if (!snapshotToRestore) return;
+    const id = snapshotToRestore;
+    setSnapshotToRestore(null);
     setIsProcessing(true);
     try {
       const fullSnapshot = await storage.loadSnapshot(id);
@@ -118,12 +124,17 @@ export const SnapshotsModal: React.FC<SnapshotsModalProps> = ({ isOpen, onClose 
     }
   };
 
-  const handleDeleteSnapshot = async (id: string) => {
-    if (confirm('Delete this saved snapshot from IndexedDB?')) {
-      await storage.deleteSnapshot(id);
-      await loadSnapshots();
-      showToast('Snapshot deleted');
-    }
+  const handleDeleteSnapshot = (id: string) => {
+    setSnapshotToDelete(id);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!snapshotToDelete) return;
+    const id = snapshotToDelete;
+    setSnapshotToDelete(null);
+    await storage.deleteSnapshot(id);
+    await loadSnapshots();
+    showToast('Snapshot deleted');
   };
 
   const handleToggleAutoSave = async () => {
@@ -301,6 +312,26 @@ export const SnapshotsModal: React.FC<SnapshotsModalProps> = ({ isOpen, onClose 
           </button>
         </div>
       </div>
+
+      <ConfirmModal
+        isOpen={snapshotToRestore !== null}
+        title="Restore VM Snapshot"
+        message="Are you sure you want to restore this VM snapshot? Current unsaved memory state will be replaced."
+        confirmLabel="Restore Snapshot"
+        isDestructive={false}
+        onConfirm={handleConfirmRestore}
+        onCancel={() => setSnapshotToRestore(null)}
+      />
+
+      <ConfirmModal
+        isOpen={snapshotToDelete !== null}
+        title="Delete Snapshot"
+        message="Are you sure you want to permanently delete this snapshot from browser IndexedDB?"
+        confirmLabel="Delete"
+        isDestructive={true}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setSnapshotToDelete(null)}
+      />
     </div>
   );
 };

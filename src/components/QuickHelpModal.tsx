@@ -98,6 +98,7 @@ export const QuickHelpModal: React.FC<QuickHelpModalProps> = ({ isOpen, onClose 
               </h4>
               <p className="text-gray-400 text-[10px] leading-relaxed">
                 Connects over WebSocket proxy relay so commands like <code className="text-cyan-300">apk</code>, <code className="text-cyan-300">git</code>, and <code className="text-cyan-300">curl</code> work over 4G/5G.
+                <br /><span className="text-amber-300">Notice:</span> Keep relay disabled or self-host for confidential tasks.
               </p>
             </div>
 

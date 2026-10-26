@@ -10,6 +10,7 @@
 import React, { useEffect, useState } from 'react';
 import { vmManager } from '../vm-manager';
 import { storage, type VMFile } from '../storage';
+import { ConfirmModal } from './ConfirmModal';
 import {
   X,
   Upload,
@@ -38,6 +39,7 @@ export const FileDrawer: React.FC<FileDrawerProps> = ({ isOpen, onClose }) => {
   const [newFileName, setNewFileName] = useState<string>('');
   const [showNewFileInput, setShowNewFileInput] = useState<boolean>(false);
   const [statusMsg, setStatusMsg] = useState<string>('');
+  const [fileToDelete, setFileToDelete] = useState<VMFile | null>(null);
 
   const refreshFiles = async () => {
     try {
@@ -104,16 +106,21 @@ export const FileDrawer: React.FC<FileDrawerProps> = ({ isOpen, onClose }) => {
     }
   };
 
-  const handleDeleteFile = async (file: VMFile) => {
-    if (confirm(`Delete '${file.name}' from Linux VM?`)) {
-      await storage.deleteFile(file.path);
-      if (selectedFile?.path === file.path) {
-        setSelectedFile(null);
-        setIsEditing(false);
-        setEditorContent('');
-      }
-      await refreshFiles();
+  const handleDeleteFile = (file: VMFile) => {
+    setFileToDelete(file);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!fileToDelete) return;
+    const path = fileToDelete.path;
+    await storage.deleteFile(path);
+    if (selectedFile?.path === path) {
+      setSelectedFile(null);
+      setIsEditing(false);
+      setEditorContent('');
     }
+    setFileToDelete(null);
+    await refreshFiles();
   };
 
   const handleCreateNewFile = async () => {
@@ -340,6 +347,17 @@ export const FileDrawer: React.FC<FileDrawerProps> = ({ isOpen, onClose }) => {
           <span className="text-[#00ff88] font-mono">{files.length} file(s)</span>
         </div>
       </div>
+
+      <ConfirmModal
+        isOpen={fileToDelete !== null}
+        title="Delete File"
+        message={`Are you sure you want to delete '${fileToDelete?.name}' from the Linux VM?`}
+        confirmLabel="Delete"
+        isDestructive={true}
+        onConfirm={handleConfirmDelete}
+        onCancel={() => setFileToDelete(null)}
+      />
     </div>
   );
 };
+

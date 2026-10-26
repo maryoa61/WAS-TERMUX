@@ -50,7 +50,10 @@ if (typeof window === 'undefined') {
             headers: newHeaders,
           });
         })
-        .catch((e) => console.warn("[coi-sw] fetch error", e))
+        .catch((e) => {
+          console.warn("[coi-sw] proxy fetch error, falling back to direct fetch", e);
+          return fetch(request);
+        })
     );
   });
 } else {

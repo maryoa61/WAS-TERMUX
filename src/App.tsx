@@ -21,6 +21,7 @@ import { SnapshotsModal } from './components/SnapshotsModal';
 import { SettingsModal } from './components/SettingsModal';
 import { QuickHelpModal } from './components/QuickHelpModal';
 import { PWAInstallButton } from './components/PWAInstallButton';
+import { ConfirmModal } from './components/ConfirmModal';
 
 import {
   Terminal as TerminalIcon,
@@ -47,6 +48,8 @@ export default function App() {
   const [scanlines, setScanlines] = useState<boolean>(false);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [zoomToast, setZoomToast] = useState<number | null>(null);
+  const [showHaltConfirm, setShowHaltConfirm] = useState(false);
+  const [relayEnabled, setRelayEnabled] = useState(false);
 
   // Modals state
   const [showFiles, setShowFiles] = useState(false);
@@ -59,9 +62,13 @@ export default function App() {
     storage.getSettings().then((settings) => {
       setFontSize(settings.fontSize || 13);
       setScanlines(settings.scanlinesEnabled || false);
+      setRelayEnabled(settings.networkRelayEnabled || false);
       vmManager.setConfig({
         memorySizeMb: settings.memoryMb,
+        networkRelayEnabled: settings.networkRelayEnabled || false,
         networkRelayUrl: settings.networkRelayUrl,
+        autoLoginUser: settings.autoLoginUser || 'root',
+        autoLoginPassword: settings.autoLoginPassword || '',
         bootImage: settings.bootImage,
       });
     });
@@ -178,12 +185,15 @@ export default function App() {
 
   const handlePowerToggle = () => {
     if (vmStatus === 'running' || vmStatus === 'booting') {
-      if (confirm('Stop Linux Virtual Machine?')) {
-        vmManager.stop();
-      }
+      setShowHaltConfirm(true);
     } else {
       vmManager.boot();
     }
+  };
+
+  const handleConfirmHalt = () => {
+    setShowHaltConfirm(false);
+    vmManager.stop();
   };
 
   return (
@@ -212,10 +222,14 @@ export default function App() {
             <span className="capitalize font-mono text-gray-300 hidden xs:inline">{vmStatus}</span>
           </div>
 
-          {/* Cellular Internet Proxy Indicator */}
-          <div className="hidden md:flex items-center gap-1 text-[10px] text-cyan-400 px-2 py-0.5 rounded bg-cyan-950/30 border border-cyan-800/40">
+          {/* Network Proxy Indicator */}
+          <div className={`hidden md:flex items-center gap-1 text-[10px] px-2 py-0.5 rounded border ${
+            relayEnabled
+              ? 'text-cyan-400 bg-cyan-950/30 border-cyan-800/40'
+              : 'text-gray-400 bg-gray-900/40 border-gray-800'
+          }`}>
             <Wifi className="w-3 h-3" />
-            <span>Cellular Proxy Active</span>
+            <span>{relayEnabled ? 'Relay Active' : 'Air-gapped'}</span>
           </div>
         </div>
 
@@ -333,6 +347,17 @@ export default function App() {
 
       {/* Quick Help & Command Cheat Sheet Modal */}
       <QuickHelpModal isOpen={showHelp} onClose={() => setShowHelp(false)} />
+
+      {/* Halt VM Confirmation Modal */}
+      <ConfirmModal
+        isOpen={showHaltConfirm}
+        title="Stop Virtual Machine"
+        message="Are you sure you want to halt the running Linux Virtual Machine?"
+        confirmLabel="Halt VM"
+        isDestructive={true}
+        onConfirm={handleConfirmHalt}
+        onCancel={() => setShowHaltConfirm(false)}
+      />
     </div>
   );
-}
+};

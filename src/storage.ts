@@ -26,7 +26,10 @@ export interface VMFile {
 }
 
 export interface AppSettings {
+  networkRelayEnabled: boolean;
   networkRelayUrl: string;
+  autoLoginUser: string;
+  autoLoginPassword?: string;
   memoryMb: number;
   bootImage: 'alpine-fast' | 'alpine-iso' | 'custom';
   customImageUrl?: string;
@@ -269,7 +272,10 @@ export class StorageManager {
    */
   async getSettings(): Promise<AppSettings> {
     const defaultSettings: AppSettings = {
+      networkRelayEnabled: false, // Disabled by default for local privacy; user can enable in Settings
       networkRelayUrl: 'wss://relay.widgetry.org/',
+      autoLoginUser: 'root',
+      autoLoginPassword: '',
       memoryMb: 256,
       bootImage: 'alpine-fast',
       fontSize: 13,

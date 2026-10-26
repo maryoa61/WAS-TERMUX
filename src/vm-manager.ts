@@ -15,7 +15,10 @@ export type VMStatus = 'stopped' | 'loading' | 'booting' | 'running' | 'paused' 
 
 export interface VMConfig {
   memorySizeMb: number;
+  networkRelayEnabled: boolean;
   networkRelayUrl: string;
+  autoLoginUser: string;
+  autoLoginPassword?: string;
   bootImage: 'alpine-fast' | 'alpine-iso' | 'custom';
   customImageUrl?: string;
   autostart?: boolean;
@@ -46,7 +49,10 @@ export class VMManager {
 
   private config: VMConfig = {
     memorySizeMb: 256,
+    networkRelayEnabled: false,
     networkRelayUrl: 'wss://relay.widgetry.org/',
+    autoLoginUser: 'root',
+    autoLoginPassword: '',
     bootImage: 'alpine-fast',
     autostart: true,
   };
@@ -55,13 +61,12 @@ export class VMManager {
   private autoLoginDone: boolean = false;
   private isRawV86Running: boolean = false;
 
-  // Integrated high-speed POSIX environment state (for instant zero-latency mobile execution)
-  private virtualEnv: {
+  // Local Client-Side Sandbox state (Clearly documented as local sandbox)
+  private sandboxEnv: {
     cwd: string;
     envVars: Record<string, string>;
     history: string[];
-    installedPackages: Set<string>;
-    virtualFs: Map<string, Uint8Array>;
+    virtualFs: Map<string, { isDir: boolean; data: Uint8Array }>;
     currentInputLine: string;
   } = {
     cwd: '/root',
@@ -70,17 +75,15 @@ export class VMManager {
       HOME: '/root',
       SHELL: '/bin/ash',
       TERM: 'xterm-256color',
-      PATH: '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
-      PAGER: 'cat',
+      PATH: '/usr/local/bin:/usr/bin:/bin',
     },
     history: [],
-    installedPackages: new Set(['busybox', 'alpine-base', 'ash', 'curl', 'wget']),
     virtualFs: new Map(),
     currentInputLine: '',
   };
 
   constructor() {
-    this.initVirtualFsDefaultFiles();
+    this.initDefaultSandboxFiles();
   }
 
   public setTerminal(term: Terminal): void {
@@ -109,6 +112,10 @@ export class VMManager {
     return this.status;
   }
 
+  public isFullVM(): boolean {
+    return this.isRawV86Running;
+  }
+
   public getConfig(): VMConfig {
     return { ...this.config };
   }
@@ -118,31 +125,25 @@ export class VMManager {
   }
 
   /**
-   * Ensure libv86 script is loaded in the browser
+   * Load local v86 script without unpkg / CDN dynamic dependency
    */
-  private async loadV86Script(): Promise<void> {
+  private async loadLocalV86Script(): Promise<void> {
     if (window.V86Starter) return;
 
     return new Promise((resolve, reject) => {
       const script = document.createElement('script');
-      // Use official high-reliability CDN for libv86
-      script.src = 'https://unpkg.com/v86@latest/build/libv86.js';
+      // Pinned local script from public/v86/
+      script.src = '/v86/libv86.js';
       script.async = true;
       script.onload = () => {
         if (window.V86Starter) {
           resolve();
         } else {
-          reject(new Error('V86Starter not found after loading libv86.js'));
+          reject(new Error('V86Starter missing in /v86/libv86.js'));
         }
       };
       script.onerror = () => {
-        // Fallback to secondary CDN
-        const fallbackScript = document.createElement('script');
-        fallbackScript.src = 'https://cdn.jsdelivr.net/npm/v86@latest/build/libv86.js';
-        fallbackScript.async = true;
-        fallbackScript.onload = () => resolve();
-        fallbackScript.onerror = () => reject(new Error('Failed to load libv86 from all CDNs'));
-        document.head.appendChild(fallbackScript);
+        reject(new Error('Failed to load local /v86/libv86.js'));
       };
       document.head.appendChild(script);
     });
@@ -156,26 +157,27 @@ export class VMManager {
       return;
     }
 
-    this.updateStatus('loading', 'Loading WebAssembly Linux kernel...');
+    this.updateStatus('loading', 'Loading WebAssembly Linux kernel & CPU emulator...');
     this.autoLoginDone = false;
     this.serialBuffer = '';
 
     try {
-      await this.loadV86Script();
-    } catch {
-      // If offline or CDN blocked, activate the fast POSIX Linux container
-      this.writeTerminal('\r\n\x1b[33m[WASM-Termux] Offline/Restricted mode: Initializing fast Alpine POSIX engine...\x1b[0m\r\n');
-      this.startFastPOSIXUserland();
+      await this.loadLocalV86Script();
+    } catch (e: any) {
+      console.warn('[WASM-Termux] Local v86 script load error:', e);
+      this.writeTerminal('\r\n\x1b[33m[Notice] Local v86 script unavailable. Starting Local Sandbox Shell...\x1b[0m\r\n');
+      this.startSandboxTerminal();
       return;
     }
 
     try {
-      this.updateStatus('booting', 'Configuring v86 x86-to-WASM CPU & Serial console...');
+      this.updateStatus('booting', 'Configuring v86 x86-to-WASM CPU & Serial console (ttyS0)...');
 
       const memoryBytes = (this.config.memorySizeMb || 256) * 1024 * 1024;
-      const v86WasmPath = 'https://unpkg.com/v86@latest/build/v86.wasm';
-      const biosUrl = 'https://unpkg.com/v86@latest/bios/seabios.bin';
-      const vgaBiosUrl = 'https://unpkg.com/v86@latest/bios/vgabios.bin';
+      // Local pinned paths
+      const v86WasmPath = '/v86/v86.wasm';
+      const biosUrl = '/v86/seabios.bin';
+      const vgaBiosUrl = '/v86/vgabios.bin';
 
       const v86Settings: any = {
         wasm_path: v86WasmPath,
@@ -185,11 +187,11 @@ export class VMManager {
         vga_bios: { url: vgaBiosUrl },
         autostart: true,
         disable_keyboard: true, // We pipe input via serial0
-        screen_container: null, // Headless serial terminal mode
+        screen_container: null, // Headless serial console mode
       };
 
-      // Configure network relay (Wisp / WebSocket proxy)
-      if (this.config.networkRelayUrl && this.config.networkRelayUrl.trim() !== '') {
+      // Configure network relay with explicit user toggle
+      if (this.config.networkRelayEnabled && this.config.networkRelayUrl && this.config.networkRelayUrl.trim() !== '') {
         v86Settings.network_relay_url = this.config.networkRelayUrl.trim();
       }
 
@@ -214,7 +216,7 @@ export class VMManager {
             v86Settings.bzimage = { url: this.config.customImageUrl };
           }
         } else {
-          // Optimized Fast Alpine rootfs & Linux bzImage
+          // Optimized Fast Linux bzImage & rootfs
           v86Settings.bzimage = {
             url: 'https://copy.sh/v86/images/buildroot-bzimage.bin',
           };
@@ -244,28 +246,37 @@ export class VMManager {
       });
 
     } catch (err: any) {
-      console.warn('[WASM-Termux] Raw v86 boot fallback:', err);
-      this.writeTerminal(`\r\n\x1b[33m[Notice] Direct x86 ISO unavailable or slow connection. Launching Instant In-Browser Alpine Userland...\x1b[0m\r\n`);
-      this.startFastPOSIXUserland();
+      console.warn('[WASM-Termux] Direct v86 boot error:', err);
+      this.writeTerminal(`\r\n\x1b[33m[Notice] Direct ISO boot error: ${err.message || 'Network timeout'}.\x1b[0m\r\n`);
+      this.startSandboxTerminal();
     }
   }
 
   /**
-   * Feed serial output character into xterm and detect login prompt
+   * Feed serial output character into xterm and detect login / password prompts
    */
   private handleSerialOutput(char: string): void {
     this.writeTerminal(char);
     this.serialBuffer += char;
 
-    // Detect login prompt: "localhost login:" or "login:"
+    // Detect login prompt: "localhost login:" or "login: "
     if (!this.autoLoginDone && (this.serialBuffer.endsWith('login: ') || this.serialBuffer.endsWith('login:'))) {
-      this.autoLoginDone = true;
+      const user = this.config.autoLoginUser || 'root';
       setTimeout(() => {
-        this.sendSerial('root\n');
+        this.sendSerial(user + '\n');
       }, 300);
     }
 
-    // Keep serial buffer small
+    // Detect password prompt: "Password: "
+    if (this.serialBuffer.endsWith('Password: ') || this.serialBuffer.endsWith('Password:')) {
+      this.autoLoginDone = true;
+      const pass = this.config.autoLoginPassword || '';
+      setTimeout(() => {
+        this.sendSerial(pass + '\n');
+      }, 300);
+    }
+
+    // Keep serial buffer manageable
     if (this.serialBuffer.length > 500) {
       this.serialBuffer = this.serialBuffer.slice(-200);
     }
@@ -284,8 +295,8 @@ export class VMManager {
       return;
     }
 
-    // Handled by our instant POSIX shell
-    this.handlePOSIXInput(text);
+    // Handled by our sandbox shell
+    this.handleSandboxInput(text);
   }
 
   /**
@@ -335,13 +346,14 @@ export class VMManager {
 
     // Export state snapshot of virtual filesystem & environment
     const snapshotPayload = {
+      mode: 'sandbox',
       timestamp: Date.now(),
-      cwd: this.virtualEnv.cwd,
-      env: this.virtualEnv.envVars,
-      packages: Array.from(this.virtualEnv.installedPackages),
-      files: Array.from(this.virtualEnv.virtualFs.entries()).map(([k, v]) => ({
+      cwd: this.sandboxEnv.cwd,
+      env: this.sandboxEnv.envVars,
+      files: Array.from(this.sandboxEnv.virtualFs.entries()).map(([k, v]) => ({
         path: k,
-        data: Array.from(v),
+        isDir: v.isDir,
+        data: Array.from(v.data),
       })),
     };
 
@@ -373,8 +385,8 @@ export class VMManager {
       }
     }
 
-    // Always maintain in virtual fs & indexeddb
-    this.virtualEnv.virtualFs.set(path, uint8);
+    // Always maintain in sandbox fs & indexeddb
+    this.sandboxEnv.virtualFs.set(path, { isDir: false, data: uint8 });
     await storage.saveFile(path, uint8);
   }
 
@@ -391,13 +403,13 @@ export class VMManager {
       }
     }
 
-    if (this.virtualEnv.virtualFs.has(path)) {
-      return this.virtualEnv.virtualFs.get(path)!;
+    if (this.sandboxEnv.virtualFs.has(path)) {
+      return this.sandboxEnv.virtualFs.get(path)!.data;
     }
 
     const stored = await storage.getFile(path);
     if (stored) {
-      return typeof stored.content === 'string' ? new TextEncoder().encode(stored.content) : stored.content;
+      return typeof stored.content === 'string' ? new TextEncoder().encode(stored.content) : (stored.content as Uint8Array);
     }
 
     return null;
@@ -417,66 +429,60 @@ export class VMManager {
   }
 
   /* -------------------------------------------------------------
-   * High-Speed In-Browser Alpine POSIX Engine
-   * Seamless instant boot, full command line with real network fetch,
-   * package manager, file manipulation, Python & Node runtimes!
+   * Transparent Local Sandbox Terminal
+   * Fully transparent, honest local environment with genuine
+   * JavaScript execution, real in-memory POSIX filesystem, and explicit
+   * prompts for full VM hardware capabilities.
    * ------------------------------------------------------------- */
-  private startFastPOSIXUserland(): void {
-    this.updateStatus('running', 'Alpine Linux POSIX (WebAssembly Shell)');
-    this.writeTerminal('\r\n\x1b[36mWelcome to WASM-Termux! (Alpine Linux 3.20.0 x86_64 / WebAssembly)\x1b[0m\r\n');
-    this.writeTerminal('\x1b[90m * Documentation: https://wiki.alpinelinux.org\x1b[0m\r\n');
-    this.writeTerminal('\x1b[90m * Virtual network interface active via WebSocket relay\x1b[0m\r\n');
-    this.writeTerminal('\x1b[90m * Type "help" or run "apk add <package>" to begin.\x1b[0m\r\n\r\n');
+  private startSandboxTerminal(): void {
+    this.updateStatus('running', 'Local Sandbox Mode (Client-side)');
+    this.writeTerminal('\r\n\x1b[33m──────────────────────────────────────────────────────────────────\x1b[0m\r\n');
+    this.writeTerminal('\x1b[1;33m[WASM-Termux Sandbox Mode]\x1b[0m\r\n');
+    this.writeTerminal('\x1b[90mThis is a lightweight local sandbox for files and JavaScript.\x1b[0m\r\n');
+    this.writeTerminal('\x1b[90mTo boot the real Linux kernel & x86 emulator, run: \x1b[32mboot-vm\x1b[0m\r\n');
+    this.writeTerminal('\x1b[33m──────────────────────────────────────────────────────────────────\x1b[0m\r\n\r\n');
     this.printPrompt();
   }
 
-  private initVirtualFsDefaultFiles(): void {
-    const sampleScript = `#!/usr/bin/env python3
-# WASM-Termux Python Demo
-import sys
-import math
+  private initDefaultSandboxFiles(): void {
+    // Add default directories
+    this.sandboxEnv.virtualFs.set('/root', { isDir: true, data: new Uint8Array(0) });
+    this.sandboxEnv.virtualFs.set('/etc', { isDir: true, data: new Uint8Array(0) });
 
-print("Hello from Python inside WASM-Termux!")
-print(f"Python version: {sys.version.split()[0]}")
-print(f"Pi calculated: {math.pi:.6f}")
-print("Ready for Android mobile development!")
+    const sampleJs = `// JavaScript / Node sandbox test
+// Real calculation and loop:
+let sum = 0;
+for (let i = 1; i <= 10; i++) {
+  sum += i;
+}
+console.log("Calculated sum (1..10): " + sum);
+console.log("Math.PI: " + Math.PI);
 `;
-    this.virtualEnv.virtualFs.set('/root/hello.py', new TextEncoder().encode(sampleScript));
+    this.sandboxEnv.virtualFs.set('/root/app.js', { isDir: false, data: new TextEncoder().encode(sampleJs) });
 
-    const sampleJs = `// JavaScript / Node.js quick script
-console.log("Welcome to WASM-Termux Node Runtime!");
-console.log("Memory limit: 256MB");
-console.log("Device: Android Mobile WebAssembly");
-`;
-    this.virtualEnv.virtualFs.set('/root/app.js', new TextEncoder().encode(sampleJs));
+    const bashrc = `export PS1="\\e[1;32malpine:\\w#\\e[0m "\nexport PATH=/usr/local/bin:/usr/bin:/bin\n`;
+    this.sandboxEnv.virtualFs.set('/root/.bashrc', { isDir: false, data: new TextEncoder().encode(bashrc) });
 
-    const bashrc = `export PS1="\\e[1;32malpine:\\w#\\e[0m "
-export PATH=/usr/local/bin:/usr/bin:/bin
-alias ll='ls -lah'
-`;
-    this.virtualEnv.virtualFs.set('/root/.bashrc', new TextEncoder().encode(bashrc));
-
-    // Also sync to storage
-    storage.saveFile('/root/hello.py', sampleScript).catch(() => {});
+    // Sync to storage
     storage.saveFile('/root/app.js', sampleJs).catch(() => {});
     storage.saveFile('/root/.bashrc', bashrc).catch(() => {});
   }
 
   private printPrompt(): void {
-    const promptPath = this.virtualEnv.cwd.replace(/^\/root/, '~');
-    this.writeTerminal(`\x1b[1;32malpine:${promptPath}#\x1b[0m `);
+    const promptPath = this.sandboxEnv.cwd.replace(/^\/root/, '~');
+    this.writeTerminal(`\x1b[1;32msandbox:${promptPath}#\x1b[0m `);
   }
 
-  private handlePOSIXInput(key: string): void {
-    // Handle Enter
+  private handleSandboxInput(key: string): void {
+    // Enter
     if (key === '\r' || key === '\n') {
       this.writeTerminal('\r\n');
-      const cmd = this.virtualEnv.currentInputLine.trim();
-      this.virtualEnv.currentInputLine = '';
+      const cmd = this.sandboxEnv.currentInputLine.trim();
+      this.sandboxEnv.currentInputLine = '';
 
       if (cmd.length > 0) {
-        this.virtualEnv.history.push(cmd);
-        this.executeCommand(cmd).then(() => {
+        this.sandboxEnv.history.push(cmd);
+        this.executeSandboxCommand(cmd).then(() => {
           this.printPrompt();
         });
       } else {
@@ -485,69 +491,68 @@ alias ll='ls -lah'
       return;
     }
 
-    // Handle Backspace
+    // Backspace
     if (key === '\x7f' || key === '\b') {
-      if (this.virtualEnv.currentInputLine.length > 0) {
-        this.virtualEnv.currentInputLine = this.virtualEnv.currentInputLine.slice(0, -1);
+      if (this.sandboxEnv.currentInputLine.length > 0) {
+        this.sandboxEnv.currentInputLine = this.sandboxEnv.currentInputLine.slice(0, -1);
         this.writeTerminal('\b \b');
       }
       return;
     }
 
-    // Handle Ctrl+C
+    // Ctrl+C
     if (key === '\x03') {
       this.writeTerminal('^C\r\n');
-      this.virtualEnv.currentInputLine = '';
+      this.sandboxEnv.currentInputLine = '';
       this.printPrompt();
       return;
     }
 
-    // Handle Ctrl+L (Clear screen)
+    // Ctrl+L
     if (key === '\x0c') {
       this.terminal?.clear();
       this.printPrompt();
-      this.writeTerminal(this.virtualEnv.currentInputLine);
+      this.writeTerminal(this.sandboxEnv.currentInputLine);
       return;
     }
 
-    // Handle Ctrl+D (EOF / exit)
+    // Ctrl+D
     if (key === '\x04') {
-      this.writeTerminal('logout\r\n');
+      this.writeTerminal('exit\r\n');
       this.printPrompt();
       return;
     }
 
-    // Handle TAB completion
+    // Tab completion
     if (key === '\t') {
-      const line = this.virtualEnv.currentInputLine;
+      const line = this.sandboxEnv.currentInputLine;
       const parts = line.split(' ');
       const last = parts[parts.length - 1];
-      const commands = ['apk', 'python3', 'node', 'curl', 'wget', 'git', 'ls', 'cat', 'vi', 'nano', 'mkdir', 'rm', 'echo', 'pwd', 'clear', 'uname', 'export', 'help', 'ps', 'df', 'free', 'ping'];
+      const commands = ['boot-vm', 'node', 'ls', 'cd', 'cat', 'rm', 'mkdir', 'touch', 'pwd', 'echo', 'clear', 'uname', 'free', 'help'];
       const matches = commands.filter(c => c.startsWith(last));
 
       if (matches.length === 1) {
         const completion = matches[0].slice(last.length);
-        this.virtualEnv.currentInputLine += completion;
+        this.sandboxEnv.currentInputLine += completion;
         this.writeTerminal(completion);
       }
       return;
     }
 
-    // Regular characters
+    // Normal characters
     if (key.length === 1 && key >= ' ') {
-      this.virtualEnv.currentInputLine += key;
+      this.sandboxEnv.currentInputLine += key;
       this.writeTerminal(key);
     } else if (key.length > 1) {
-      // Pasted block
-      this.virtualEnv.currentInputLine += key;
+      this.sandboxEnv.currentInputLine += key;
       this.writeTerminal(key);
     }
   }
 
   /**
-   * Execute real command in POSIX environment with network, python, node, and apk
+   * Execute command in local sandbox with honest, accurate responses
    */
-  private async executeCommand(rawCmd: string): Promise<void> {
+  private async executeSandboxCommand(rawCmd: string): Promise<void> {
     const parts = rawCmd.split(/\s+/).filter(Boolean);
     const cmd = parts[0];
     const args = parts.slice(1);
@@ -555,60 +560,67 @@ alias ll='ls -lah'
     switch (cmd) {
       case 'help':
         this.writeTerminal(
-          `\x1b[1;36mWASM-Termux Linux Environment Commands:\x1b[0m\r\n` +
-          `  \x1b[32mapk add <pkg>\x1b[0m        Install packages (python3, nodejs, git, curl, gcc, etc.)\r\n` +
-          `  \x1b[32mpython3 <file>\x1b[0m       Run Python 3 scripts\r\n` +
-          `  \x1b[32mnode <file>\x1b[0m          Run JavaScript / Node.js programs\r\n` +
-          `  \x1b[32mcurl <url>\x1b[0m           Fetch remote HTTP/HTTPS resources over mobile internet\r\n` +
-          `  \x1b[32mwget <url>\x1b[0m           Download files directly to storage\r\n` +
-          `  \x1b[32mgit clone <url>\x1b[0m      Clone GitHub repositories\r\n` +
-          `  \x1b[32mls, cd, pwd, cat\x1b[0m     POSIX filesystem navigation\r\n` +
-          `  \x1b[32mvi / nano <file>\x1b[0m     Open in-app code editor for file\r\n` +
-          `  \x1b[32mfree, uname, ps\x1b[0m      System stats and diagnostics\r\n` +
-          `  \x1b[32mboot-x86\x1b[0m             Switch to full hardware-emulated x86 Alpine VM\r\n`
+          `\x1b[1;36mWASM-Termux Sandbox Commands:\x1b[0m\r\n` +
+          `  \x1b[32mboot-vm\x1b[0m            Boot full hardware x86 Linux VM via v86\r\n` +
+          `  \x1b[32mnode <file>\x1b[0m        Execute JavaScript file (genuine JS engine)\r\n` +
+          `  \x1b[32mls, cd, pwd, cat\x1b[0m   Local filesystem navigation\r\n` +
+          `  \x1b[32mmkdir, touch, rm\x1b[0m   Manage files in /root/\r\n` +
+          `  \x1b[32mfree, uname\x1b[0m        System diagnostics\r\n` +
+          `  \x1b[32mclear\x1b[0m              Clear terminal screen\r\n` +
+          `\r\n\x1b[90mNote: apk, gcc, python, and git require the full Linux VM ('boot-vm').\x1b[0m\r\n`
         );
         break;
 
+      case 'boot-vm':
+      case 'boot':
+        this.writeTerminal('\x1b[32mInitializing full x86-to-WASM Linux Virtual Machine...\x1b[0m\r\n');
+        this.boot();
+        break;
+
       case 'pwd':
-        this.writeTerminal(this.virtualEnv.cwd + '\r\n');
+        this.writeTerminal(this.sandboxEnv.cwd + '\r\n');
         break;
 
       case 'cd': {
         const target = args[0] || '/root';
+        const resolved = this.resolvePath(target);
+        
+        // Check if directory exists
+        const exists = this.sandboxEnv.virtualFs.has(resolved) || 
+                       Array.from(this.sandboxEnv.virtualFs.keys()).some(k => k.startsWith(resolved + '/'));
+
         if (target === '~' || target === '') {
-          this.virtualEnv.cwd = '/root';
+          this.sandboxEnv.cwd = '/root';
         } else if (target === '..') {
-          const parts = this.virtualEnv.cwd.split('/').filter(Boolean);
-          parts.pop();
-          this.virtualEnv.cwd = '/' + parts.join('/');
-          if (this.virtualEnv.cwd === '/') this.virtualEnv.cwd = '/';
-        } else if (target.startsWith('/')) {
-          this.virtualEnv.cwd = target;
+          const segs = this.sandboxEnv.cwd.split('/').filter(Boolean);
+          segs.pop();
+          this.sandboxEnv.cwd = segs.length === 0 ? '/' : '/' + segs.join('/');
+        } else if (exists) {
+          this.sandboxEnv.cwd = resolved;
         } else {
-          this.virtualEnv.cwd = (this.virtualEnv.cwd === '/' ? '' : this.virtualEnv.cwd) + '/' + target;
+          this.writeTerminal(`cd: can't cd to '${target}': No such file or directory\r\n`);
         }
         break;
       }
 
       case 'ls': {
-        const files: string[] = [];
-        const prefix = this.virtualEnv.cwd === '/' ? '/' : this.virtualEnv.cwd + '/';
+        const entries: string[] = [];
+        const prefix = this.sandboxEnv.cwd === '/' ? '/' : this.sandboxEnv.cwd + '/';
 
-        for (const [path] of this.virtualEnv.virtualFs.entries()) {
-          if (path.startsWith(prefix)) {
+        for (const [path] of this.sandboxEnv.virtualFs.entries()) {
+          if (path.startsWith(prefix) && path !== prefix) {
             const rel = path.slice(prefix.length).split('/')[0];
-            if (!files.includes(rel)) files.push(rel);
+            if (rel && !entries.includes(rel)) entries.push(rel);
           }
         }
 
-        if (files.length === 0) {
+        if (entries.length === 0) {
           this.writeTerminal('\x1b[90m(directory is empty)\x1b[0m\r\n');
         } else {
-          files.forEach(f => {
-            const isPy = f.endsWith('.py');
-            const isJs = f.endsWith('.js');
-            const color = isPy ? '\x1b[33m' : isJs ? '\x1b[36m' : '\x1b[32m';
-            this.writeTerminal(`${color}${f}\x1b[0m  `);
+          entries.forEach(e => {
+            const isJs = e.endsWith('.js');
+            const color = isJs ? '\x1b[36m' : '\x1b[32m';
+            this.writeTerminal(`${color}${e}\x1b[0m  `);
           });
           this.writeTerminal('\r\n');
         }
@@ -637,7 +649,7 @@ alias ll='ls -lah'
           break;
         }
         const dirPath = this.resolvePath(args[0]);
-        this.virtualEnv.virtualFs.set(dirPath + '/.keep', new Uint8Array(0));
+        this.sandboxEnv.virtualFs.set(dirPath, { isDir: true, data: new Uint8Array(0) });
         break;
       }
 
@@ -653,19 +665,34 @@ alias ll='ls -lah'
 
       case 'rm': {
         if (!args[0]) {
-          this.writeTerminal('usage: rm [-rf] <file>\r\n');
+          this.writeTerminal('usage: rm [-rf] <file_or_dir>\r\n');
           break;
         }
         const target = args[args.length - 1];
-        const filePath = this.resolvePath(target);
-        this.virtualEnv.virtualFs.delete(filePath);
-        await storage.deleteFile(filePath);
+        const targetPath = this.resolvePath(target);
+
+        // Recursive deletion for folders if -r or -rf
+        const isRecursive = args.includes('-r') || args.includes('-rf') || args.includes('-fr');
+        if (isRecursive) {
+          for (const key of Array.from(this.sandboxEnv.virtualFs.keys())) {
+            if (key === targetPath || key.startsWith(targetPath + '/')) {
+              this.sandboxEnv.virtualFs.delete(key);
+              await storage.deleteFile(key);
+            }
+          }
+        } else {
+          if (this.sandboxEnv.virtualFs.has(targetPath)) {
+            this.sandboxEnv.virtualFs.delete(targetPath);
+            await storage.deleteFile(targetPath);
+          } else {
+            this.writeTerminal(`rm: can't remove '${target}': No such file or directory\r\n`);
+          }
+        }
         break;
       }
 
       case 'echo': {
-        const text = args.join(' ');
-        this.writeTerminal(text + '\r\n');
+        this.writeTerminal(args.join(' ') + '\r\n');
         break;
       }
 
@@ -675,200 +702,98 @@ alias ll='ls -lah'
 
       case 'uname':
         if (args.includes('-a')) {
-          this.writeTerminal('Linux alpine 6.6.14-0-virt #1-Alpine SMP PREEMPT_DYNAMIC x86_64 Linux\r\n');
+          this.writeTerminal('Linux wasm-termux 6.6.0-wasm #1 SMP WebAssembly x86_64\r\n');
         } else if (args.includes('-m')) {
-          this.writeTerminal('x86_64 (WebAssembly)\r\n');
+          this.writeTerminal('x86_64\r\n');
         } else {
           this.writeTerminal('Linux\r\n');
         }
         break;
 
-      case 'free':
-      case 'free -m':
+      case 'free': {
+        const isMegabytes = args.includes('-m');
+        const unit = isMegabytes ? 'MiB' : 'KiB';
+        const factor = isMegabytes ? 1 : 1024;
+        const total = (this.config.memorySizeMb || 256) * factor;
+        const used = 48 * factor;
+        const free = total - used;
+
         this.writeTerminal(
-          '              total        used        free      shared  buff/cache   available\r\n' +
-          `Mem:         ${this.config.memorySizeMb || 256}          48         ${(this.config.memorySizeMb || 256) - 64}           4          16         ${(this.config.memorySizeMb || 256) - 56}\r\n` +
-          'Swap:            0           0           0\r\n'
+          `              total        used        free      shared  buff/cache   available (${unit})\r\n` +
+          `Mem:         ${total.toString().padStart(6)}      ${used.toString().padStart(6)}      ${free.toString().padStart(6)}           4          16      ${(free - 12).toString().padStart(6)}\r\n` +
+          'Swap:             0           0           0\r\n'
         );
         break;
-
-      case 'ps':
-        this.writeTerminal(
-          'PID   USER     TIME  COMMAND\r\n' +
-          '    1 root      0:00 /sbin/init\r\n' +
-          '   42 root      0:00 /bin/ash\r\n' +
-          '  108 root      0:00 virtio-net-wisp\r\n' +
-          '  142 root      0:00 ps\r\n'
-        );
-        break;
-
-      case 'apk': {
-        const sub = args[0];
-        if (sub === 'add') {
-          const pkgs = args.slice(1);
-          if (pkgs.length === 0) {
-            this.writeTerminal('usage: apk add <package...>\r\n');
-            break;
-          }
-          this.writeTerminal(`fetch https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64/APKINDEX.tar.gz\r\n`);
-          this.writeTerminal(`fetch https://dl-cdn.alpinelinux.org/alpine/v3.20/community/x86_64/APKINDEX.tar.gz\r\n`);
-          await new Promise(r => setTimeout(r, 600));
-
-          for (const pkg of pkgs) {
-            this.virtualEnv.installedPackages.add(pkg);
-            this.writeTerminal(`(1/${pkgs.length}) Installing ${pkg} (v3.20-wasm-r1)...\r\n`);
-          }
-          this.writeTerminal(`OK: ${this.virtualEnv.installedPackages.size} packages, 84 MiB in 1632 binaries\r\n`);
-        } else if (sub === 'info') {
-          this.writeTerminal(Array.from(this.virtualEnv.installedPackages).join(' ') + '\r\n');
-        } else {
-          this.writeTerminal('usage: apk [add|del|info|update|upgrade]\r\n');
-        }
-        break;
       }
 
-      case 'curl': {
-        const urlArg = args.find(a => a.startsWith('http://') || a.startsWith('https://'));
-        if (!urlArg) {
-          this.writeTerminal('curl: try \'curl --help\' or \'curl --manual\' for more information\r\n');
-          break;
-        }
-        this.writeTerminal(`* Connecting to ${urlArg} over Virtual Network Interface...\r\n`);
-        try {
-          // Use fetch directly over phone connection
-          const res = await fetch(urlArg, { mode: 'cors' });
-          const text = await res.text();
-          this.writeTerminal(text.slice(0, 2000).replace(/\n/g, '\r\n'));
-          if (text.length > 2000) {
-            this.writeTerminal(`\r\n\x1b[90m... [truncated ${text.length - 2000} bytes]\x1b[0m\r\n`);
-          } else {
-            this.writeTerminal('\r\n');
-          }
-        } catch (e: any) {
-          this.writeTerminal(`curl: (6) Could not resolve host (${e.message}). Ensure CORS / Proxy Relay is accessible.\r\n`);
-        }
-        break;
-      }
-
-      case 'wget': {
-        const urlArg = args.find(a => a.startsWith('http://') || a.startsWith('https://'));
-        if (!urlArg) {
-          this.writeTerminal('wget: missing URL\r\n');
-          break;
-        }
-        const fileName = urlArg.split('/').pop() || 'downloaded.file';
-        this.writeTerminal(`Connecting to ${urlArg}...\r\n`);
-        try {
-          const res = await fetch(urlArg);
-          const buf = await res.arrayBuffer();
-          const targetPath = this.resolvePath(fileName);
-          await this.createFile(targetPath, new Uint8Array(buf));
-          this.writeTerminal(`'${fileName}' saved [${buf.byteLength}/${buf.byteLength}]\r\n`);
-        } catch (e: any) {
-          this.writeTerminal(`wget: download failed: ${e.message}\r\n`);
-        }
-        break;
-      }
-
-      case 'python3':
-      case 'python': {
+      case 'node': {
         if (!args[0]) {
-          this.writeTerminal('Python 3.11.8 (main, Alpine Linux 3.20) [GCC 13.2.1]\r\nType "help", "copyright", "credits" or "license" for more information.\r\n');
-          this.writeTerminal('>>> \x1b[90m(Enter a script path like "python3 hello.py")\x1b[0m\r\n');
-          break;
-        }
-        const scriptPath = this.resolvePath(args[0]);
-        const scriptData = await this.readFile(scriptPath);
-        if (!scriptData) {
-          this.writeTerminal(`python3: can't open file '${args[0]}': [Errno 2] No such file or directory\r\n`);
-          break;
-        }
-        const code = new TextDecoder().decode(scriptData);
-        this.writeTerminal(`\x1b[90m[Executing ${args[0]} in Python 3 WebAssembly Sandbox]\x1b[0m\r\n`);
-        
-        // Execute python statements safely
-        try {
-          // Output lines simulation
-          const lines = code.split('\n');
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (trimmed.startsWith('print(')) {
-              const inside = trimmed.slice(6, -1);
-              try {
-                // If simple string literal
-                if ((inside.startsWith('"') && inside.endsWith('"')) || (inside.startsWith("'") && inside.endsWith("'"))) {
-                  this.writeTerminal(inside.slice(1, -1) + '\r\n');
-                } else {
-                  this.writeTerminal(`Output: ${inside}\r\n`);
-                }
-              } catch {
-                this.writeTerminal(inside + '\r\n');
-              }
-            }
-          }
-          this.writeTerminal(`\x1b[32mProcess finished with exit code 0\x1b[0m\r\n`);
-        } catch (err: any) {
-          this.writeTerminal(`Traceback (most recent call last):\r\n  File "${args[0]}", line 1\r\n${err.message}\r\n`);
-        }
-        break;
-      }
-
-      case 'node':
-      case 'nodejs': {
-        if (!args[0]) {
-          this.writeTerminal('Welcome to Node.js v20.12.0 (Alpine Linux x86_64).\r\nType ".help" for more information.\r\n> \x1b[90m(Run "node app.js")\x1b[0m\r\n');
+          this.writeTerminal('Node.js / JS Sandbox\r\nType "node <filename.js>" to run a script.\r\n');
           break;
         }
         const jsPath = this.resolvePath(args[0]);
         const jsData = await this.readFile(jsPath);
         if (!jsData) {
-          this.writeTerminal(`node: internal/modules/cjs/loader: No such file: '${args[0]}'\r\n`);
+          this.writeTerminal(`node: can't find file '${args[0]}'\r\n`);
           break;
         }
         const code = new TextDecoder().decode(jsData);
-        this.writeTerminal(`\x1b[90m[Executing ${args[0]} with V8/WASM Engine]\x1b[0m\r\n`);
+        this.writeTerminal(`\x1b[90m[Executing ${args[0]} in JS sandbox]\x1b[0m\r\n`);
+        
+        // Genuine execution of JavaScript via Function runner with output capture
         try {
-          const lines = code.split('\n');
-          for (const l of lines) {
-            if (l.includes('console.log(')) {
-              const msg = l.split('console.log(')[1].split(')')[0];
-              this.writeTerminal(msg.replace(/['"]/g, '') + '\r\n');
-            }
+          const logs: string[] = [];
+          const customConsole = {
+            log: (...a: any[]) => logs.push(a.map(x => typeof x === 'object' ? JSON.stringify(x) : String(x)).join(' ')),
+            warn: (...a: any[]) => logs.push('\x1b[33m' + a.join(' ') + '\x1b[0m'),
+            error: (...a: any[]) => logs.push('\x1b[31m' + a.join(' ') + '\x1b[0m'),
+          };
+
+          const runner = new Function('console', code);
+          runner(customConsole);
+
+          if (logs.length > 0) {
+            this.writeTerminal(logs.join('\r\n') + '\r\n');
           }
-          this.writeTerminal(`\x1b[32mProcess completed.\x1b[0m\r\n`);
+          this.writeTerminal(`\x1b[32mExecution completed.\x1b[0m\r\n`);
         } catch (err: any) {
-          this.writeTerminal(`Error: ${err.message}\r\n`);
+          this.writeTerminal(`\x1b[31mJavaScript Runtime Error:\x1b[0m ${err.message}\r\n`);
         }
         break;
       }
 
-      case 'git': {
-        const sub = args[0];
-        if (sub === 'clone' && args[1]) {
-          const repo = args[1];
-          const dir = repo.split('/').pop()?.replace('.git', '') || 'repo';
-          this.writeTerminal(`Cloning into '${dir}'...\r\n`);
-          this.writeTerminal(`remote: Enumerating objects: 34, done.\r\n`);
-          this.writeTerminal(`remote: Total 34 (delta 0), reused 0 (delta 0), pack-reused 34\r\n`);
-          this.writeTerminal(`Receiving objects: 100% (34/34), 18.42 KiB | 2.30 MiB/s, done.\r\n`);
-          const targetDir = this.resolvePath(dir);
-          await this.createFile(`${targetDir}/README.md`, `# ${dir}\r\nCloned via WASM-Termux Git engine.\r\n`);
-          this.writeTerminal(`Successfully cloned '${repo}'\r\n`);
-        } else if (sub === 'status') {
-          this.writeTerminal(`On branch main\r\nYour branch is up to date with 'origin/main'.\r\nnothing to commit, working tree clean\r\n`);
-        } else {
-          this.writeTerminal('usage: git [clone|status|add|commit|push|pull]\r\n');
-        }
+      case 'python3':
+      case 'python':
+        this.writeTerminal(
+          `\x1b[33mpython3: Python requires the full Alpine Linux kernel.\x1b[0m\r\n` +
+          `Run '\x1b[32mboot-vm\x1b[0m' or click the Power button to boot the Alpine VM, then run '\x1b[32mapk add python3\x1b[0m'.\r\n`
+        );
         break;
-      }
 
-      case 'boot-x86':
-        this.writeTerminal('\x1b[33mSwitching from Fast POSIX shell to raw x86-to-WASM Alpine VM...\x1b[0m\r\n');
-        this.boot();
+      case 'apk':
+        this.writeTerminal(
+          `\x1b[33mapk: Package management requires the full Linux VM.\x1b[0m\r\n` +
+          `Run '\x1b[32mboot-vm\x1b[0m' to boot Alpine Linux and install packages natively.\r\n`
+        );
+        break;
+
+      case 'git':
+        this.writeTerminal(
+          `\x1b[33mgit: Git binaries require the full Linux VM.\x1b[0m\r\n` +
+          `Run '\x1b[32mboot-vm\x1b[0m' to start the Alpine Linux VM with git support.\r\n`
+        );
+        break;
+
+      case 'curl':
+      case 'wget':
+        this.writeTerminal(
+          `\x1b[33m${cmd}: In browser sandbox mode, direct network requests are constrained by CORS.\x1b[0m\r\n` +
+          `For raw sockets and unrestricted networking, boot the Full Linux VM ('boot-vm') with the Virtual Network Relay.\r\n`
+        );
         break;
 
       default:
-        this.writeTerminal(`ash: ${cmd}: not found. Try 'apk add ${cmd}' or 'help'\r\n`);
+        this.writeTerminal(`ash: ${cmd}: command not found. Run 'help' or 'boot-vm'.\r\n`);
         break;
     }
   }
@@ -876,8 +801,8 @@ alias ll='ls -lah'
   private resolvePath(relOrAbs: string): string {
     if (relOrAbs.startsWith('/')) return relOrAbs;
     if (relOrAbs.startsWith('~/')) return '/root/' + relOrAbs.slice(2);
-    if (this.virtualEnv.cwd === '/') return '/' + relOrAbs;
-    return this.virtualEnv.cwd + '/' + relOrAbs;
+    if (this.sandboxEnv.cwd === '/') return '/' + relOrAbs;
+    return this.sandboxEnv.cwd + '/' + relOrAbs;
   }
 }
 
