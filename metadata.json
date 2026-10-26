@@ -1,0 +1,7 @@
+{
+  "name": "WASM-Termux: In-Browser Linux Terminal & Coding Environment",
+  "description": "100% Serverless, in-browser Alpine Linux terminal and development environment for Android powered by WebAssembly (v86), with Termux extra keys, IndexedDB state persistence, and virtual network proxy.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
